@@ -25,6 +25,7 @@ OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWA
 #![no_main]
 #![no_std]
 
+use core::any::Any;
 #[cfg(debug)]
 use stage_1::bios_println;
 
@@ -50,7 +51,8 @@ extern "C" fn bit16_entry(disk_number: u16) {
     enter_rust(disk_number);
 }
 
-static mut TEMP_ALLOC: MaybeUninit<SimpleBumpAllocator> = MaybeUninit::uninit();
+static mut BOOT_ALLOC: MaybeUninit<SimpleBumpAllocator> = MaybeUninit::uninit();
+static mut MEMORY_ALLOC: MaybeUninit<SimpleBumpAllocator> = MaybeUninit::uninit();
 
 fn enter_rust(disk_id: u16) {
     BiosTextMode::print_int_bytes(b"Quantum Bootloader (Stage1)\n");
@@ -60,27 +62,78 @@ fn enter_rust(disk_id: u16) {
     };
     BiosTextMode::print_int_bytes(b" OK\n");
 
-    
+    BiosTextMode::print_int_bytes( b"Getting Memory Map\n");
+
+    unsafe {
+        MEMORY_ALLOC.write(SimpleBumpAllocator::new_from_ptr((0x00007C00) as *mut u8, 512));
+    }
+
+    let memory_alloc = unsafe { MEMORY_ALLOC.assume_init_mut() };
+
+    let amount_of_entries_allowed = 10;
+    let memory_region_len = amount_of_entries_allowed * size_of::<E820Entry>();
+
+    let memory_region =
+        memory_alloc
+            .allocate_region(memory_region_len + 0x10)
+            .unwrap();
+
+    let e820_ptr = memory_region as *mut [u8] as *mut E820Entry;
+    let e820_ref = unsafe { core::slice::from_raw_parts_mut(e820_ptr, amount_of_entries_allowed) };
+
+    get_memory_map(e820_ref);
+
+
+
+    let mut amount_of_entries_found = 0;
+    for entry in e820_ref.iter_mut() {
+        if entry.address > 0 || entry.len > 0 {
+            amount_of_entries_found += 1;
+        } else {
+            break;
+        }
+    }
+
+    BiosTextMode::print_int_bytes(b"OK\n");
+
+    let mut useable_region = None;
+
+    for i in 0..amount_of_entries_found {
+        let element = e820_ref[i];
+        if element.len >= 0x03200000 && element.entry_type == 1 {
+            useable_region = Some(element);
+        }
+    }
+
+
+
     // TODO: Detect Memory First so we know if we have enough space, and where to put it.
     //       We should also look into reimplementing a lot of the 'BootInfo' Struct due
     //       to how it only gives a limited amount of info to the next stage. There
     //       is already a fixme in the bootloader noting that we "don't" know the state
     //       of the vga buffer.
     unsafe {
-        TEMP_ALLOC.write(SimpleBumpAllocator::new_from_ptr((0x00100000) as *mut u8, 0x03200000));
+        let mut address = useable_region.unwrap().address;
+        address &= (u64::MAX ^ (0x1000 - 1));
+        address += 0x1000;
+        BOOT_ALLOC.write(SimpleBumpAllocator::new_from_ptr((address) as *mut u8, useable_region.unwrap().len as usize));
     }
 
-    let temp_alloc = unsafe { TEMP_ALLOC.assume_init_mut() };
+    let boot_alloc = unsafe { BOOT_ALLOC.assume_init_mut() };
+
+    boot_alloc.allocate_region(16);
 
     let boot_info: &mut BootInfo = unsafe {
         &mut *(
-            temp_alloc
+            boot_alloc
                 .allocate_region(size_of::<BootInfo>() + 0x10)
                 .unwrap()
                 .as_mut_ptr()
                 as *mut BootInfo)
     };
 
+
+    BiosTextMode::print_int_bytes(b"foo\n");
     *boot_info = BootInfo::new();
 
     BiosTextMode::print_int_bytes(b"Loading files ");
@@ -92,7 +145,7 @@ fn enter_rust(disk_id: u16) {
             .expect("Could detect bootloader partition, please add \'/bootloader/bootloader.cfg\' to the bootloader filesystem for a proper boot!");
 
     let bootloader_config_file_ptr =
-        temp_alloc.allocate_region(0x00100000 - (size_of::<BootInfo>() + 0x10)).unwrap();
+        boot_alloc.allocate_region(0x00100000 - (size_of::<BootInfo>() + 0x10)).unwrap();
     let bootloader_filename = "/bootloader/bootloader.cfg";
 
     fs.load_file_into_slice(bootloader_config_file_ptr, bootloader_filename)
@@ -110,7 +163,7 @@ fn enter_rust(disk_id: u16) {
         .expect("Could not get stage2 filesize");
 
     let next_2_stage_ptr =
-        temp_alloc
+        boot_alloc
             .allocate_region(0x00100000)
             .unwrap();
 
@@ -119,7 +172,7 @@ fn enter_rust(disk_id: u16) {
         .expect("Could not get stage3 filesize");
 
     let next_3_stage_ptr =
-        temp_alloc
+        boot_alloc
             .allocate_region(next_3_stage_bytes + 0x10)
             .unwrap();
 
@@ -128,7 +181,7 @@ fn enter_rust(disk_id: u16) {
         .expect("Could not get kernel filesize");
 
     let kernel_ptr =
-        temp_alloc
+        boot_alloc
             .allocate_region(kernel_filesize_bytes + 0x10)
             .unwrap();
 
@@ -169,27 +222,7 @@ fn enter_rust(disk_id: u16) {
 
     BiosTextMode::print_int_bytes(b"Getting memory map ... ");
 
-    let amount_of_entries_allowed = 10;
-    let memory_region_len = amount_of_entries_allowed * size_of::<E820Entry>();
 
-    let memory_region =
-        temp_alloc
-            .allocate_region(memory_region_len + 0x10)
-            .unwrap();
-
-    let e820_ptr = memory_region as *mut [u8] as *mut E820Entry;
-    let e820_ref = unsafe { core::slice::from_raw_parts_mut(e820_ptr, amount_of_entries_allowed) };
-
-    get_memory_map(e820_ref);
-
-    let mut amount_of_entries_found = 0;
-    for entry in e820_ref {
-        if entry.address > 0 || entry.len > 0 {
-            amount_of_entries_found += 1;
-        } else {
-            break;
-        }
-    }
 
     boot_info.set_memory_map(e820_ptr, amount_of_entries_found);
 
